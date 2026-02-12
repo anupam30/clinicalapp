@@ -355,8 +355,25 @@ serve(async (req: Request) => {
       // if finalize is true, fall through to analysis using the stored transcript
     }
 
-    // Choose transcript: stored (if conversationId) or incoming
-    const transcript = (conversationId && conversationStore.get(conversationId)) || incomingTranscript;
+    // Choose transcript: prefer in-memory store, otherwise fall back to DB (if available), otherwise incoming
+    let transcript = (conversationId && conversationStore.get(conversationId)) || incomingTranscript;
+
+    // If no transcript in-memory and we have a Supabase client, try to fetch the persisted transcript
+    if ((!transcript || transcript.trim().length === 0) && conversationId && supabaseClient) {
+      try {
+        const { data, error } = await supabaseClient
+          .from('medical_conversations')
+          .select('transcript')
+          .eq('id', conversationId)
+          .single();
+        if (!error && data && data.transcript) {
+          transcript = data.transcript;
+          console.log('[extract-medical] Loaded transcript from DB for', conversationId);
+        }
+      } catch (e) {
+        console.warn('[extract-medical] Failed to load transcript from DB:', e instanceof Error ? e.message : e);
+      }
+    }
 
     if (!transcript || transcript.trim().length === 0) {
       return new Response(
