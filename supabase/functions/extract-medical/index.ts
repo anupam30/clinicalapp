@@ -11,11 +11,18 @@ interface MedicalAnalysisRequest {
   transcript: string;
   model?: string;
   provider?: string;
+  promptOverride?: string;
 }
 
 interface MedicalAnalysis {
   chiefComplaint: string;
   symptoms: string[];
+  chief_complaints?: string[] | null;
+  duration_of_symptoms?: string | null;
+  past_medical_history?: string[] | null;
+  medication_history?: Array<{ name: string; dosage?: string | null; frequency?: string | null; duration?: string | null }> | null;
+  allergies?: string[] | null;
+  clinical_findings?: string[] | null;
   medicalHistory: string;
   diagnosis: string;
   medications: Array<{
@@ -23,10 +30,22 @@ interface MedicalAnalysis {
     dosage: string;
     frequency: string;
     duration: string;
+    timing?: string | null;
+    composition?: string[] | null;
   }>;
+  medications_prescribed?: Array<{
+    name: string;
+    dosage: string | null;
+    frequency: string | null;
+    duration: string | null;
+    timing: string | null;
+    composition: string[] | null;
+  }> | null;
   instructions: string[];
+  advice?: string[] | null;
   investigationsSuggested: string[];
   followUp: string;
+  follow_up_instructions?: string | null;
   physicalExamination: string[];
   vitalSigns?: {
     bloodPressure?: string;
@@ -59,29 +78,56 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   console.log('[extract-medical] Supabase persistence not configured (SUPABASE_URL or SERVICE_ROLE_KEY missing)');
 }
 
-const MEDICAL_ANALYSIS_PROMPT = `You are an expert medical analysis AI specialized in analyzing doctor-patient consultations, particularly for Indian medical context.
+const DEFAULT_MEDICAL_ANALYSIS_PROMPT = `You are a clinical documentation AI assistant.
 
-Your task: Analyze the doctor-patient conversation and extract structured medical information.
+Your task is to analyze a doctor-patient conversation transcript and extract structured medical information.
 
-IMPORTANT: Return ONLY valid JSON with NO markdown formatting, NO code blocks, NO explanations. Just pure JSON.
+You must rely on semantic understanding, medical reasoning, and full conversational context.
+Do NOT use rule-based word matching.
+Do NOT guess missing facts.
+Do NOT invent medications or diagnoses.
+Only extract what is clearly stated or strongly implied by medical reasoning.
+If something is not mentioned, return null.
+
+IMPORTANT: Return ONLY valid JSON with no markdown and no extra text.
 
 Return this exact JSON structure:
 {
-  "chiefComplaint": "Main reason for visit",
+  "chiefComplaint": "Main reason for visit or null",
   "symptoms": ["symptom1", "symptom2"],
+  "chief_complaints": ["complaint 1", "complaint 2"],
+  "duration_of_symptoms": "duration string or null",
+  "past_medical_history": ["history item"] or null,
+  "medication_history": [{"name":"...","dosage":"...","frequency":"...","duration":"..."}] or null,
+  "allergies": ["allergy"] or null,
+  "clinical_findings": ["doctor observation"] or null,
   "medicalHistory": "Any past medical conditions mentioned",
   "diagnosis": "Doctor's diagnosis or assessment",
   "medications": [
     {
-      "name": "Medicine name (use Indian brand names if mentioned)",
-      "dosage": "e.g., 500mg, 10ml",
-      "frequency": "e.g., twice daily, once at night",
-      "duration": "e.g., 5 days, 2 weeks"
+      "name": "Medicine name",
+      "dosage": "e.g., 500mg, 10ml (must include units)",
+      "frequency": "e.g., twice daily",
+      "duration": "e.g., 5 days",
+      "timing": "before meal|after meal|with food|at bedtime|null",
+      "composition": ["salt/composition if known"]
+    }
+  ],
+  "medications_prescribed": [
+    {
+      "name": "Medicine name",
+      "dosage": "with units or null",
+      "frequency": "frequency or null",
+      "duration": "duration or null",
+      "timing": "before meal|after meal|with food|at bedtime|null",
+      "composition": ["salt/composition if known"] or null
     }
   ],
   "instructions": ["Special instruction 1", "Special instruction 2"],
+  "advice": ["hydration/rest/diet/lifestyle advice"] or null,
   "investigationsSuggested": ["Test/Investigation 1"],
   "followUp": "When to come back",
+  "follow_up_instructions": "Timeline and follow-up instructions or null",
   "physicalExamination": ["Examination done"],
   "vitalSigns": {
     "bloodPressure": "if mentioned",
@@ -92,16 +138,27 @@ Return this exact JSON structure:
 }
 
 Rules:
-1. Extract ONLY information explicitly mentioned in the conversation
-2. If information is not mentioned, set to empty string or empty array
-3. Use Indian medical terminology and brand names
-4. Be concise and factual
-5. Return ONLY JSON, absolutely NO other text
+1. Extract only what is stated or strongly implied by clinical context.
+2. If missing, return null (not guessed values).
+3. Extract only real medicines prescribed by doctor.
+4. Do not include conversational words/fillers.
+5. Dosage must include units; parse frequency/duration if implied.
+6. Do not split one medicine into multiple entries.
+7. Include lifestyle advice and follow-up timeline when present.
+8. Keep both legacy fields and new fields populated consistently.
 
 Conversation transcript:`;
 
-async function callOpenAI(model: string, transcript: string): Promise<MedicalAnalysis> {
+function resolveMedicalPrompt(promptOverride?: string): string {
+  const envPrompt = Deno.env.get("MEDICAL_ANALYSIS_SYSTEM_PROMPT");
+  if (promptOverride && promptOverride.trim().length > 0) return promptOverride;
+  if (envPrompt && envPrompt.trim().length > 0) return envPrompt;
+  return DEFAULT_MEDICAL_ANALYSIS_PROMPT;
+}
+
+async function callOpenAI(model: string, transcript: string, promptOverride?: string): Promise<MedicalAnalysis> {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
+  const systemPrompt = resolveMedicalPrompt(promptOverride);
 
   // Server-side lightweight fallback extractor if no API key or calls fail
   function localFallbackAnalyzeServer(text: string): MedicalAnalysis {
@@ -157,7 +214,7 @@ async function callOpenAI(model: string, transcript: string): Promise<MedicalAna
           messages: [
             {
               role: "system",
-              content: MEDICAL_ANALYSIS_PROMPT,
+              content: systemPrompt,
             },
             {
               role: "user",
@@ -307,6 +364,7 @@ serve(async (req: Request) => {
       transcript: incomingTranscript,
       model = "gpt-4o-mini",
       provider,
+      promptOverride,
       conversationId,
       chunk,
       append = false,
@@ -321,6 +379,7 @@ serve(async (req: Request) => {
       finalize,
       model,
       provider,
+      hasPromptOverride: !!promptOverride,
       incomingTranscriptPreview: incomingTranscript ? (incomingTranscript.length > 500 ? incomingTranscript.slice(0, 500) + '...[truncated]' : incomingTranscript) : null,
     });
 
@@ -395,7 +454,7 @@ serve(async (req: Request) => {
     let analysis: MedicalAnalysis;
 
     // Only OpenAI provider is supported here
-    analysis = await callOpenAI(model, clippedTranscript);
+    analysis = await callOpenAI(model, clippedTranscript, promptOverride);
 
     // If we finalized this conversation, delete its stored transcript
     if (conversationId && finalize) {
