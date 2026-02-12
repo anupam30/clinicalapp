@@ -36,7 +36,7 @@ interface MedicalAnalysis {
   };
 }
 
-type LLMProvider = 'openai' | 'gemini' | 'claude';
+type LLMProvider = 'openai';
 
 // Ephemeral in-memory store for streaming/patching of transcripts.
 // Note: This does not persist between cold starts or multiple function instances.
@@ -227,72 +227,49 @@ async function validateOpenAI(): Promise<{ ok: boolean; detail?: any }> {
   }
 }
 
-async function callGemini(model: string, prompt: string): Promise<MedicalAnalysis> {
-  const apiKey = Deno.env.get("GEMINI_API_KEY");
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY not configured in Supabase secrets");
-  }
-
-  console.log(`[callGemini] Calling Gemini with model: ${model}`);
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                text: prompt,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 1500,
-        },
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    const errorData = await response.json();
-    console.error("[callGemini] Gemini API error:", errorData);
-    throw new Error(`Gemini API error: ${response.status} ${response.statusText} - ${JSON.stringify(errorData)}`);
-  }
-
-  const data = await response.json();
-  const contentText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-  if (!contentText) {
-    console.error("[callGemini] No content in Gemini response:", data);
-    throw new Error("Empty response from Gemini");
-  }
-
-  console.log(`[callGemini] Received response, parsing JSON...`);
-  
-  // Clean markdown if present
-  const cleanedContent = contentText.replace(/```json\n?|\n?```/g, "").trim();
-  const analysis: MedicalAnalysis = JSON.parse(cleanedContent);
-  
-  return analysis;
-}
+// Gemini support removed — OpenAI is the only provider used by the function now.
 
 serve(async (req: Request) => {
+  // Small helper to mask sensitive headers for logs
+  function maskHeaders(headers: Headers): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of headers.entries()) {
+      if (k.toLowerCase() === 'authorization' || k.toLowerCase().includes('key')) {
+        out[k] = v ? 'REDACTED' : '';
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  // Read raw body once so we can both log a preview and parse JSON safely
+  let rawBody = '';
+  try {
+    rawBody = await req.text();
+  } catch (e) {
+    rawBody = '';
+  }
+
+  // Log incoming request (redacting sensitive headers)
+  try {
+    console.log('[extract-medical] Incoming request', {
+      method: req.method,
+      url: (req as any).url || 'unknown',
+      headers: maskHeaders(req.headers),
+      bodyPreview: rawBody ? (rawBody.length > 2000 ? rawBody.slice(0, 2000) + '...[truncated]' : rawBody) : '',
+    });
+  } catch (e) {
+    console.warn('[extract-medical] Failed to log incoming request:', e instanceof Error ? e.message : e);
+  }
+
   // Enable CORS
   if (req.method === "OPTIONS") {
     return new Response("OK", {
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
       },
     });
   }
@@ -316,8 +293,16 @@ serve(async (req: Request) => {
     });
   }
 
-  try {
-    const body = await req.json().catch(() => ({}));
+    try {
+    // Parse JSON from the raw body we already read above
+    let body: any = {};
+    try {
+      body = rawBody && rawBody.length > 0 ? JSON.parse(rawBody) : {};
+    } catch (e) {
+      console.warn('[extract-medical] Failed to parse JSON body:', e instanceof Error ? e.message : e);
+      body = {};
+    }
+
     const {
       transcript: incomingTranscript,
       model = "gpt-4o-mini",
@@ -327,6 +312,17 @@ serve(async (req: Request) => {
       append = false,
       finalize = false,
     } = body as any;
+
+    // Additional debug log for commonly used fields
+    console.log('[extract-medical] Parsed request fields', {
+      conversationId: conversationId || null,
+      hasChunk: typeof chunk === 'string',
+      append,
+      finalize,
+      model,
+      provider,
+      incomingTranscriptPreview: incomingTranscript ? (incomingTranscript.length > 500 ? incomingTranscript.slice(0, 500) + '...[truncated]' : incomingTranscript) : null,
+    });
 
     // If client sends a chunk with conversationId, append or overwrite the stored transcript
     if (conversationId && typeof chunk === 'string') {
@@ -388,18 +384,8 @@ serve(async (req: Request) => {
       );
     }
 
-    // Detect provider from model name if not explicitly provided
-    let detectedProvider: LLMProvider = (provider as LLMProvider) || 'gemini';
-    if (!provider) {
-      if (model.includes('gpt')) {
-        detectedProvider = 'openai';
-      } else if (model.includes('claude')) {
-        detectedProvider = 'claude';
-      } else {
-        detectedProvider = 'gemini';
-      }
-    }
-
+    // Use OpenAI for analysis
+    const detectedProvider: LLMProvider = 'openai';
     console.log(`[extract-medical] Processing with provider: ${detectedProvider}, model: ${model}`);
 
     // Clip transcript to reasonable size to avoid huge requests
@@ -408,13 +394,8 @@ serve(async (req: Request) => {
 
     let analysis: MedicalAnalysis;
 
-    if (detectedProvider === 'openai') {
-      analysis = await callOpenAI(model, clippedTranscript);
-    } else if (detectedProvider === 'gemini') {
-      analysis = await callGemini(model, clippedTranscript);
-    } else {
-      throw new Error(`Unsupported provider: ${detectedProvider}`);
-    }
+    // Only OpenAI provider is supported here
+    analysis = await callOpenAI(model, clippedTranscript);
 
     // If we finalized this conversation, delete its stored transcript
     if (conversationId && finalize) {
