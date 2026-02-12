@@ -156,24 +156,97 @@ function resolveMedicalPrompt(promptOverride?: string): string {
   return DEFAULT_MEDICAL_ANALYSIS_PROMPT;
 }
 
+function ensureStringArray(value: any): string[] {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v ?? '').trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(/,|\n/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function sanitizeMedicationEntries(input: any): Array<{ name: string; dosage: string; frequency: string; duration: string; timing?: string | null; composition?: string[] | null }> {
+  const source = Array.isArray(input) ? input : [];
+  const stopWords = new Set([
+    'i', 'you', 'we', 'he', 'she', 'it', 'they', 'my', 'your', 'patient', 'doctor', 'medicine',
+    'take', 'takes', 'taking', 'had', 'have', 'has', 'feeling', 'pain', 'fever', 'cough', 'cold',
+    'yes', 'no', 'okay', 'ok', 'hmm', 'hmmm', 'hmm.', 'thank', 'thanks', 'hello', 'hi'
+  ]);
+
+  const cleaned = source
+    .map((m: any) => {
+      const name = String(m?.name ?? '').trim();
+      const dosage = String(m?.dosage ?? '').trim();
+      const frequency = String(m?.frequency ?? '').trim();
+      const duration = String(m?.duration ?? '').trim();
+      const timing = m?.timing == null ? null : String(m.timing);
+      const composition = Array.isArray(m?.composition) ? m.composition.map((c: any) => String(c).trim()).filter(Boolean) : null;
+      return { name, dosage, frequency, duration, timing, composition };
+    })
+    .filter((m) => m.name.length >= 3)
+    .filter((m) => !stopWords.has(m.name.toLowerCase()))
+    .filter((m) => /^[a-zA-Z0-9+\-\s()./]+$/.test(m.name))
+    .filter((m) => {
+      // keep entries that have at least one strong prescription signal
+      const hasDosageUnit = /\b\d+\s?(mg|ml|mcg|g|units?)\b/i.test(m.dosage);
+      const hasFrequency = /once|twice|thrice|daily|night|morning|afternoon|evening|bd|tid|qid|sos|prn/i.test(m.frequency);
+      const hasDuration = /\b\d+\s?(day|days|week|weeks|month|months)\b/i.test(m.duration);
+      return hasDosageUnit || hasFrequency || hasDuration;
+    });
+
+  const unique = new Map<string, { name: string; dosage: string; frequency: string; duration: string; timing?: string | null; composition?: string[] | null }>();
+  for (const med of cleaned) {
+    const key = med.name.toLowerCase();
+    if (!unique.has(key)) unique.set(key, med);
+  }
+  return Array.from(unique.values());
+}
+
+function sanitizeMedicalAnalysis(raw: any): MedicalAnalysis {
+  const medicationsFromPrimary = sanitizeMedicationEntries(raw?.medications);
+  const medicationsFromSecondary = sanitizeMedicationEntries(raw?.medications_prescribed);
+  const medications = medicationsFromPrimary.length > 0 ? medicationsFromPrimary : medicationsFromSecondary;
+
+  return {
+    chiefComplaint: String(raw?.chiefComplaint ?? ''),
+    symptoms: ensureStringArray(raw?.symptoms),
+    chief_complaints: ensureStringArray(raw?.chief_complaints),
+    duration_of_symptoms: raw?.duration_of_symptoms ?? null,
+    past_medical_history: ensureStringArray(raw?.past_medical_history),
+    medication_history: Array.isArray(raw?.medication_history) ? raw.medication_history : null,
+    allergies: ensureStringArray(raw?.allergies),
+    clinical_findings: ensureStringArray(raw?.clinical_findings),
+    medicalHistory: String(raw?.medicalHistory ?? ''),
+    diagnosis: String(raw?.diagnosis ?? ''),
+    medications,
+    medications_prescribed: medications.map((m) => ({
+      name: m.name,
+      dosage: m.dosage || null,
+      frequency: m.frequency || null,
+      duration: m.duration || null,
+      timing: m.timing ?? null,
+      composition: m.composition ?? null,
+    })),
+    instructions: ensureStringArray(raw?.instructions),
+    advice: ensureStringArray(raw?.advice),
+    investigationsSuggested: ensureStringArray(raw?.investigationsSuggested),
+    followUp: String(raw?.followUp ?? ''),
+    follow_up_instructions: raw?.follow_up_instructions ?? null,
+    physicalExamination: ensureStringArray(raw?.physicalExamination),
+    vitalSigns: raw?.vitalSigns && typeof raw.vitalSigns === 'object' ? raw.vitalSigns : {},
+  } as MedicalAnalysis;
+}
+
 async function callOpenAI(model: string, transcript: string, promptOverride?: string): Promise<MedicalAnalysis> {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   const systemPrompt = resolveMedicalPrompt(promptOverride);
 
   // Server-side lightweight fallback extractor if no API key or calls fail
   function localFallbackAnalyzeServer(text: string): MedicalAnalysis {
-    const meds: Array<{ name: string; dosage: string; frequency: string; duration: string }> = [];
-    const medRegex = /([A-Za-z][A-Za-z0-9\s\-]{1,40}?)(?:,|\s)\s*(\d+\s?mg|\d+\s?ml|\d+g|\d+\s?units)?(?:\s*(once|twice|thrice|\b\d+ times\b|daily|nightly|at night|in the morning))?(?:\s*(?:for|x)\s*(\d+\s*(?:days?|weeks?|months?)))?/gi;
-    let match: RegExpExecArray | null;
-    while ((match = medRegex.exec(text))) {
-      const name = (match[1] || '').trim();
-      const dosage = (match[2] || '').trim();
-      const frequency = (match[3] || '').trim();
-      const duration = (match[4] || '').trim();
-      if (name) {
-        meds.push({ name, dosage: dosage || '', frequency: frequency || '', duration: duration || '' });
-      }
-    }
     const complainMatch = text.match(/(fever|cough|pain|headache|stomach|vomit|diarrhoea|cold|sore throat)/i);
     const chiefComplaint = complainMatch ? complainMatch[0] : '';
     return {
@@ -181,7 +254,7 @@ async function callOpenAI(model: string, transcript: string, promptOverride?: st
       symptoms: [],
       medicalHistory: '',
       diagnosis: '',
-      medications: meds,
+      medications: [],
       instructions: [],
       investigationsSuggested: [],
       followUp: '',
@@ -249,8 +322,8 @@ async function callOpenAI(model: string, transcript: string, promptOverride?: st
 
       console.log(`[callOpenAI] Received response, parsing JSON...`);
       const cleanedContent = contentText.replace(/```json\n?|\n?```/g, "").trim();
-      const analysis: MedicalAnalysis = JSON.parse(cleanedContent);
-      return analysis;
+      const analysis = JSON.parse(cleanedContent);
+      return sanitizeMedicalAnalysis(analysis);
     } catch (err) {
       console.error(`[callOpenAI] Fetch error (attempt ${attempt}):`, err instanceof Error ? err.message : err);
       lastError = err;
@@ -455,6 +528,7 @@ serve(async (req: Request) => {
 
     // Only OpenAI provider is supported here
     analysis = await callOpenAI(model, clippedTranscript, promptOverride);
+    analysis = sanitizeMedicalAnalysis(analysis);
 
     // If we finalized this conversation, delete its stored transcript
     if (conversationId && finalize) {
