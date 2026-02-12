@@ -1,6 +1,7 @@
 // @ts-ignore: Deno std import (allowed in runtime, may not be resolvable by TS server)
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 // Supabase client for optional persistence (server-side)
+// @ts-ignore: remote CDN import may not resolve in local TS server but is valid in Deno runtime
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm";
 
 // Provide a lightweight declaration for the Deno runtime for TypeScript checks
